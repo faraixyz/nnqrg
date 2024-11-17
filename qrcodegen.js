@@ -1,5 +1,5 @@
 /*
- * QR Code generator library (compiled from TypeScript)
+ * QR Code generator library (TypeScript)
  *
  * Copyright (c) Project Nayuki. (MIT License)
  * https://www.nayuki.io/page/qr-code-generator-library
@@ -41,17 +41,93 @@ var qrcodegen;
      * (Note that all ways require supplying the desired error correction level.)
      */
     class QrCode {
+        /*-- Static factory functions (high level) --*/
+        // Returns a QR Code representing the given Unicode text string at the given error correction level.
+        // As a conservative upper bound, this function is guaranteed to succeed for strings that have 738 or fewer
+        // Unicode code points (not UTF-16 code units) if the low error correction level is used. The smallest possible
+        // QR Code version is automatically chosen for the output. The ECC level of the result may be higher than the
+        // ecl argument if it can be done without increasing the version.
+        static encodeText(text, ecl) {
+            const segs = qrcodegen.QrSegment.makeSegments(text);
+            return QrCode.encodeSegments(segs, ecl);
+        }
+        // Returns a QR Code representing the given binary data at the given error correction level.
+        // This function always encodes using the binary segment mode, not any text mode. The maximum number of
+        // bytes allowed is 2953. The smallest possible QR Code version is automatically chosen for the output.
+        // The ECC level of the result may be higher than the ecl argument if it can be done without increasing the version.
+        static encodeBinary(data, ecl) {
+            const seg = qrcodegen.QrSegment.makeBytes(data);
+            return QrCode.encodeSegments([seg], ecl);
+        }
+        /*-- Static factory functions (mid level) --*/
+        // Returns a QR Code representing the given segments with the given encoding parameters.
+        // The smallest possible QR Code version within the given range is automatically
+        // chosen for the output. Iff boostEcl is true, then the ECC level of the result
+        // may be higher than the ecl argument if it can be done without increasing the
+        // version. The mask number is either between 0 to 7 (inclusive) to force that
+        // mask, or -1 to automatically choose an appropriate mask (which may be slow).
+        // This function allows the user to create a custom sequence of segments that switches
+        // between modes (such as alphanumeric and byte) to encode text in less space.
+        // This is a mid-level API; the high-level API is encodeText() and encodeBinary().
+        static encodeSegments(segs, ecl, minVersion = 1, maxVersion = 40, mask = -1, boostEcl = true) {
+            if (!(QrCode.MIN_VERSION <= minVersion && minVersion <= maxVersion && maxVersion <= QrCode.MAX_VERSION)
+                || mask < -1 || mask > 7)
+                throw new RangeError("Invalid value");
+            // Find the minimal version number to use
+            let version;
+            let dataUsedBits;
+            for (version = minVersion; ; version++) {
+                const dataCapacityBits = QrCode.getNumDataCodewords(version, ecl) * 8; // Number of data bits available
+                const usedBits = QrSegment.getTotalBits(segs, version);
+                if (usedBits <= dataCapacityBits) {
+                    dataUsedBits = usedBits;
+                    break; // This version number is found to be suitable
+                }
+                if (version >= maxVersion) // All versions in the range could not fit the given data
+                    throw new RangeError("Data too long");
+            }
+            // Increase the error correction level while the data still fits in the current version number
+            for (const newEcl of [QrCode.Ecc.MEDIUM, QrCode.Ecc.QUARTILE, QrCode.Ecc.HIGH]) { // From low to high
+                if (boostEcl && dataUsedBits <= QrCode.getNumDataCodewords(version, newEcl) * 8)
+                    ecl = newEcl;
+            }
+            // Concatenate all segments to create the data bit string
+            let bb = [];
+            for (const seg of segs) {
+                appendBits(seg.mode.modeBits, 4, bb);
+                appendBits(seg.numChars, seg.mode.numCharCountBits(version), bb);
+                for (const b of seg.getData())
+                    bb.push(b);
+            }
+            assert(bb.length == dataUsedBits);
+            // Add terminator and pad up to a byte if applicable
+            const dataCapacityBits = QrCode.getNumDataCodewords(version, ecl) * 8;
+            assert(bb.length <= dataCapacityBits);
+            appendBits(0, Math.min(4, dataCapacityBits - bb.length), bb);
+            appendBits(0, (8 - bb.length % 8) % 8, bb);
+            assert(bb.length % 8 == 0);
+            // Pad with alternating bytes until data capacity is reached
+            for (let padByte = 0xEC; bb.length < dataCapacityBits; padByte ^= 0xEC ^ 0x11)
+                appendBits(padByte, 8, bb);
+            // Pack bits into bytes in big endian
+            let dataCodewords = [];
+            while (dataCodewords.length * 8 < bb.length)
+                dataCodewords.push(0);
+            bb.forEach((b, i) => dataCodewords[i >>> 3] |= b << (7 - (i & 7)));
+            // Create the QR Code object
+            return new QrCode(version, ecl, dataCodewords, mask);
+        }
         /*-- Constructor (low level) and fields --*/
         // Creates a new QR Code with the given version number,
         // error correction level, data codeword bytes, and mask number.
         // This is a low-level API that most users should not use directly.
         // A mid-level API is the encodeSegments() function.
         constructor(
-        // The version number of this QR Code, which is between 1 and 40 (inclusive).
-        // This determines the size of this barcode.
-        version, 
-        // The error correction level used in this QR Code.
-        errorCorrectionLevel, dataCodewords, msk) {
+            // The version number of this QR Code, which is between 1 and 40 (inclusive).
+            // This determines the size of this barcode.
+            version,
+            // The error correction level used in this QR Code.
+            errorCorrectionLevel, dataCodewords, msk) {
             this.version = version;
             this.errorCorrectionLevel = errorCorrectionLevel;
             // The modules of this QR Code (false = light, true = dark).
@@ -96,82 +172,6 @@ var qrcodegen;
             this.applyMask(msk); // Apply the final choice of mask
             this.drawFormatBits(msk); // Overwrite old format bits
             this.isFunction = [];
-        }
-        /*-- Static factory functions (high level) --*/
-        // Returns a QR Code representing the given Unicode text string at the given error correction level.
-        // As a conservative upper bound, this function is guaranteed to succeed for strings that have 738 or fewer
-        // Unicode code points (not UTF-16 code units) if the low error correction level is used. The smallest possible
-        // QR Code version is automatically chosen for the output. The ECC level of the result may be higher than the
-        // ecl argument if it can be done without increasing the version.
-        static encodeText(text, ecl) {
-            const segs = qrcodegen.QrSegment.makeSegments(text);
-            return QrCode.encodeSegments(segs, ecl);
-        }
-        // Returns a QR Code representing the given binary data at the given error correction level.
-        // This function always encodes using the binary segment mode, not any text mode. The maximum number of
-        // bytes allowed is 2953. The smallest possible QR Code version is automatically chosen for the output.
-        // The ECC level of the result may be higher than the ecl argument if it can be done without increasing the version.
-        static encodeBinary(data, ecl) {
-            const seg = qrcodegen.QrSegment.makeBytes(data);
-            return QrCode.encodeSegments([seg], ecl);
-        }
-        /*-- Static factory functions (mid level) --*/
-        // Returns a QR Code representing the given segments with the given encoding parameters.
-        // The smallest possible QR Code version within the given range is automatically
-        // chosen for the output. Iff boostEcl is true, then the ECC level of the result
-        // may be higher than the ecl argument if it can be done without increasing the
-        // version. The mask number is either between 0 to 7 (inclusive) to force that
-        // mask, or -1 to automatically choose an appropriate mask (which may be slow).
-        // This function allows the user to create a custom sequence of segments that switches
-        // between modes (such as alphanumeric and byte) to encode text in less space.
-        // This is a mid-level API; the high-level API is encodeText() and encodeBinary().
-        static encodeSegments(segs, ecl, minVersion = 1, maxVersion = 40, mask = -1, boostEcl = true) {
-            if (!(QrCode.MIN_VERSION <= minVersion && minVersion <= maxVersion && maxVersion <= QrCode.MAX_VERSION)
-                || mask < -1 || mask > 7)
-                throw new RangeError("Invalid value");
-            // Find the minimal version number to use
-            let version;
-            let dataUsedBits;
-            for (version = minVersion;; version++) {
-                const dataCapacityBits = QrCode.getNumDataCodewords(version, ecl) * 8; // Number of data bits available
-                const usedBits = QrSegment.getTotalBits(segs, version);
-                if (usedBits <= dataCapacityBits) {
-                    dataUsedBits = usedBits;
-                    break; // This version number is found to be suitable
-                }
-                if (version >= maxVersion) // All versions in the range could not fit the given data
-                    throw new RangeError("Data too long");
-            }
-            // Increase the error correction level while the data still fits in the current version number
-            for (const newEcl of [QrCode.Ecc.MEDIUM, QrCode.Ecc.QUARTILE, QrCode.Ecc.HIGH]) { // From low to high
-                if (boostEcl && dataUsedBits <= QrCode.getNumDataCodewords(version, newEcl) * 8)
-                    ecl = newEcl;
-            }
-            // Concatenate all segments to create the data bit string
-            let bb = [];
-            for (const seg of segs) {
-                appendBits(seg.mode.modeBits, 4, bb);
-                appendBits(seg.numChars, seg.mode.numCharCountBits(version), bb);
-                for (const b of seg.getData())
-                    bb.push(b);
-            }
-            assert(bb.length == dataUsedBits);
-            // Add terminator and pad up to a byte if applicable
-            const dataCapacityBits = QrCode.getNumDataCodewords(version, ecl) * 8;
-            assert(bb.length <= dataCapacityBits);
-            appendBits(0, Math.min(4, dataCapacityBits - bb.length), bb);
-            appendBits(0, (8 - bb.length % 8) % 8, bb);
-            assert(bb.length % 8 == 0);
-            // Pad with alternating bytes until data capacity is reached
-            for (let padByte = 0xEC; bb.length < dataCapacityBits; padByte ^= 0xEC ^ 0x11)
-                appendBits(padByte, 8, bb);
-            // Pack bits into bytes in big endian
-            let dataCodewords = [];
-            while (dataCodewords.length * 8 < bb.length)
-                dataCodewords.push(0);
-            bb.forEach((b, i) => dataCodewords[i >>> 3] |= b << (7 - (i & 7)));
-            // Create the QR Code object
-            return new QrCode(version, ecl, dataCodewords, mask);
         }
         /*-- Accessor methods --*/
         // Returns the color of the module (pixel) at the given coordinates, which is false
@@ -465,8 +465,7 @@ var qrcodegen;
                 return [];
             else {
                 const numAlign = Math.floor(this.version / 7) + 2;
-                const step = (this.version == 32) ? 26 :
-                    Math.ceil((this.version * 4 + 4) / (numAlign * 2 - 2)) * 2;
+                const step = Math.floor((this.version * 8 + numAlign * 3 + 5) / (numAlign * 4 - 4)) * 2;
                 let result = [6];
                 for (let pos = this.size - 7; result.length < numAlign; pos -= step)
                     result.splice(1, 0, pos);
@@ -495,7 +494,7 @@ var qrcodegen;
         static getNumDataCodewords(ver, ecl) {
             return Math.floor(QrCode.getNumRawDataModules(ver) / 8) -
                 QrCode.ECC_CODEWORDS_PER_BLOCK[ecl.ordinal][ver] *
-                    QrCode.NUM_ERROR_CORRECTION_BLOCKS[ecl.ordinal][ver];
+                QrCode.NUM_ERROR_CORRECTION_BLOCKS[ecl.ordinal][ver];
         }
         // Returns a Reed-Solomon ECC generator polynomial for the given degree. This could be
         // implemented as a lookup table over all possible parameter values, instead of as an algorithm.
@@ -587,17 +586,17 @@ var qrcodegen;
     QrCode.ECC_CODEWORDS_PER_BLOCK = [
         // Version: (note that index 0 is for padding, and is set to an illegal value)
         //0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40    Error correction level
-        [-1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
-        [-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28],
-        [-1, 13, 22, 18, 26, 18, 24, 18, 22, 20, 24, 28, 26, 24, 20, 30, 24, 28, 28, 26, 30, 28, 30, 30, 30, 30, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
+        [-1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30], // Low
+        [-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28], // Medium
+        [-1, 13, 22, 18, 26, 18, 24, 18, 22, 20, 24, 28, 26, 24, 20, 30, 24, 28, 28, 26, 30, 28, 30, 30, 30, 30, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30], // Quartile
         [-1, 17, 28, 22, 16, 22, 28, 26, 26, 24, 28, 24, 28, 22, 24, 24, 30, 28, 28, 26, 28, 30, 24, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30], // High
     ];
     QrCode.NUM_ERROR_CORRECTION_BLOCKS = [
         // Version: (note that index 0 is for padding, and is set to an illegal value)
         //0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40    Error correction level
-        [-1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25],
-        [-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49],
-        [-1, 1, 1, 2, 2, 4, 4, 6, 6, 8, 8, 8, 10, 12, 16, 12, 17, 16, 18, 21, 20, 23, 23, 25, 27, 29, 34, 34, 35, 38, 40, 43, 45, 48, 51, 53, 56, 59, 62, 65, 68],
+        [-1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25], // Low
+        [-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49], // Medium
+        [-1, 1, 1, 2, 2, 4, 4, 6, 6, 8, 8, 8, 10, 12, 16, 12, 17, 16, 18, 21, 20, 23, 23, 25, 27, 29, 34, 34, 35, 38, 40, 43, 45, 48, 51, 53, 56, 59, 62, 65, 68], // Quartile
         [-1, 1, 1, 2, 4, 4, 4, 5, 6, 8, 8, 11, 11, 16, 16, 18, 16, 19, 21, 25, 25, 25, 34, 30, 32, 35, 37, 40, 42, 45, 48, 51, 54, 57, 60, 63, 66, 70, 74, 77, 81], // High
     ];
     qrcodegen.QrCode = QrCode;
@@ -631,26 +630,6 @@ var qrcodegen;
      * Any segment longer than this is meaningless for the purpose of generating QR Codes.
      */
     class QrSegment {
-        /*-- Constructor (low level) and fields --*/
-        // Creates a new QR Code segment with the given attributes and data.
-        // The character count (numChars) must agree with the mode and the bit buffer length,
-        // but the constraint isn't checked. The given bit buffer is cloned and stored.
-        constructor(
-        // The mode indicator of this segment.
-        mode, 
-        // The length of this segment's unencoded data. Measured in characters for
-        // numeric/alphanumeric/kanji mode, bytes for byte mode, and 0 for ECI mode.
-        // Always zero or positive. Not the same as the data's bit length.
-        numChars, 
-        // The data bits of this segment. Accessed through getData().
-        bitData) {
-            this.mode = mode;
-            this.numChars = numChars;
-            this.bitData = bitData;
-            if (numChars < 0)
-                throw new RangeError("Invalid argument");
-            this.bitData = bitData.slice(); // Make defensive copy
-        }
         /*-- Static factory functions (mid level) --*/
         // Returns a segment representing the given binary data encoded in
         // byte mode. All input byte arrays are acceptable. Any text string
@@ -668,7 +647,7 @@ var qrcodegen;
             let bb = [];
             for (let i = 0; i < digits.length;) { // Consume up to 3 digits per iteration
                 const n = Math.min(digits.length - i, 3);
-                appendBits(parseInt(digits.substr(i, n), 10), n * 3 + 1, bb);
+                appendBits(parseInt(digits.substring(i, i + n), 10), n * 3 + 1, bb);
                 i += n;
             }
             return new QrSegment(QrSegment.Mode.NUMERIC, digits.length, bb);
@@ -734,6 +713,26 @@ var qrcodegen;
         static isAlphanumeric(text) {
             return QrSegment.ALPHANUMERIC_REGEX.test(text);
         }
+        /*-- Constructor (low level) and fields --*/
+        // Creates a new QR Code segment with the given attributes and data.
+        // The character count (numChars) must agree with the mode and the bit buffer length,
+        // but the constraint isn't checked. The given bit buffer is cloned and stored.
+        constructor(
+            // The mode indicator of this segment.
+            mode,
+            // The length of this segment's unencoded data. Measured in characters for
+            // numeric/alphanumeric/kanji mode, bytes for byte mode, and 0 for ECI mode.
+            // Always zero or positive. Not the same as the data's bit length.
+            numChars,
+            // The data bits of this segment. Accessed through getData().
+            bitData) {
+            this.mode = mode;
+            this.numChars = numChars;
+            this.bitData = bitData;
+            if (numChars < 0)
+                throw new RangeError("Invalid argument");
+            this.bitData = bitData.slice(); // Make defensive copy
+        }
         /*-- Methods --*/
         // Returns a new copy of the data bits of this segment.
         getData() {
@@ -759,7 +758,7 @@ var qrcodegen;
                 if (str.charAt(i) != "%")
                     result.push(str.charCodeAt(i));
                 else {
-                    result.push(parseInt(str.substr(i + 1, 2), 16));
+                    result.push(parseInt(str.substring(i + 1, i + 3), 16));
                     i += 2;
                 }
             }
@@ -786,10 +785,10 @@ var qrcodegen;
         class Ecc {
             /*-- Constructor and fields --*/
             constructor(
-            // In the range 0 to 3 (unsigned 2-bit integer).
-            ordinal, 
-            // (Package-private) In the range 0 to 3 (unsigned 2-bit integer).
-            formatBits) {
+                // In the range 0 to 3 (unsigned 2-bit integer).
+                ordinal,
+                // (Package-private) In the range 0 to 3 (unsigned 2-bit integer).
+                formatBits) {
                 this.ordinal = ordinal;
                 this.formatBits = formatBits;
             }
@@ -812,10 +811,10 @@ var qrcodegen;
         class Mode {
             /*-- Constructor and fields --*/
             constructor(
-            // The mode indicator bits, which is a uint4 value (range 0 to 15).
-            modeBits, 
-            // Number of character count bits for three different version ranges.
-            numBitsCharCount) {
+                // The mode indicator bits, which is a uint4 value (range 0 to 15).
+                modeBits,
+                // Number of character count bits for three different version ranges.
+                numBitsCharCount) {
                 this.modeBits = modeBits;
                 this.numBitsCharCount = numBitsCharCount;
             }
