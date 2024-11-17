@@ -1,0 +1,31 @@
+html {
+    font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+    line-height: 1.5;
+}
+
+body {
+    max-width: 80ch;
+    margin-inline: auto;
+    padding: 0.5rem;
+}
+
+.header, footer {
+    text-align: center;
+}
+
+.genform {
+    text-align: center;
+}
+
+.genform form {
+    margin-top: 1rem;
+}
+
+svg {
+    margin-inline: auto;
+}
+
+input, button {
+    font: inherit;
+    margin: 0.25rem;
+}
